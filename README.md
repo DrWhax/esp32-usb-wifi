@@ -3,15 +3,30 @@
 ESP32-S3 port of [pico-usb-wifi](../pico-usb-wifi): a driverless USB Wi-Fi
 adapter (USB CDC-NCM device bridging to a Wi-Fi station).
 
-Current state: **Phase 0/2 seed** — Espressif's `tusb_ncm` example from
-ESP-IDF v5.5 (`examples/peripherals/usb/device/tusb_ncm`, Unlicense/CC0),
-project-renamed. It already does the core data path from the port plan
-(`../pico-usb-wifi/esp32_plan.md`): station MAC adoption, raw L2 forwarding
-via `esp_wifi_internal_tx`/`_reg_rxcb`, no `esp_netif`, TinyUSB NCM via
-`esp_tinyusb`. Upstream's README is kept as `README.upstream.md`.
+Seeded from Espressif's `tusb_ncm` example (ESP-IDF v5.5,
+`examples/peripherals/usb/device/tusb_ncm`, Unlicense/CC0; upstream README
+kept as `README.upstream.md`), extended per the port plan
+(`../pico-usb-wifi/esp32_plan.md`) with:
 
-Not yet ported (see the plan): reflection filter, IP snooping, management
-console + profiles in NVS, scan/join, debug stats, watchdog/crash telemetry.
+* station MAC adoption + raw L2 forwarding (`esp_wifi_internal_*`, no `esp_netif`)
+* reflection filter (drops the host's own frames echoed back by the AP)
+* host IPv4/IPv6 snooping (the device holds no IP; the console reports the host's)
+* **management console** on CDC-ACM (composite NCM + ACM): `set ssid` /
+  `set pass` apply immediately, `save` persists to NVS — credentials survive
+  reboot and reflash; compile-time creds are only a never-provisioned fallback
+* `tools/provision.py <ssid> [password]` — scripted provisioning over the console
+
+Not yet ported (see the plan): multi-profile store, scan/join, periodic debug
+stats stream, watchdog/crash telemetry, LED states.
+
+## Provisioning
+
+```sh
+. ~/esp/esp-idf/export.sh          # or: pip install pyserial
+tools/provision.py "MyNetwork" "hunter2"
+```
+
+Or interactively: `picocom /dev/cu.usbmodem1234561` (any baud), then `help`.
 
 ## Build
 
