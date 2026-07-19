@@ -1,19 +1,27 @@
 /* Management console on CDC-ACM 0 of the composite USB device, plus the NVS
- * credential store. Runtime provisioning: credentials set here take effect
- * immediately and survive reboots, so the compile-time defaults are only a
- * fallback for a never-provisioned device.
+ * configuration store: up to 8 credential profiles, the active-profile index,
+ * and the debug flag. Runtime provisioning: changes apply immediately and
+ * `save` persists them, so the compile-time defaults are only a fallback for a
+ * never-provisioned device.
  *
- * Command handling runs in the TinyUSB task context (CDC RX callback); commands
- * are short and NVS writes take a few ms, which the bridge tolerates. */
+ * Command handling runs in the TinyUSB task context (CDC RX callback), so
+ * nothing here may block: the scan is asynchronous (results are printed from
+ * the WIFI_EVENT_SCAN_DONE handler) and the debug stats stream runs on an
+ * esp_timer. Commands are short and NVS writes take a few ms, which the
+ * bridge tolerates. */
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_event.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
 #include "nvs.h"
 #include "tinyusb_cdc_acm.h"
 
@@ -22,16 +30,33 @@
 static const char *TAG = "console";
 
 #define NVS_NAMESPACE "wificfg"
-#define SSID_MAX 32
-#define PASS_MAX 64
+#define CFG_MAGIC 0x45555731u /* "EUW1" */
+#define MAX_PROFILES 8
+#define MAX_SCAN 20
 
-/* Working copy of the credentials: edited by `set`, applied immediately,
- * persisted by `save`. */
-static char s_ssid[SSID_MAX + 1];
-static char s_pass[PASS_MAX + 1];
+typedef struct {
+    char ssid[33];
+    char pass[65];
+} profile_t;
+
+typedef struct {
+    uint32_t magic;
+    uint8_t active; /* index into p[] */
+    uint8_t debug;
+    profile_t p[MAX_PROFILES];
+} cfg_blob_t;
+
+static cfg_blob_t s_cfg; /* working copy: edited by commands, persisted by `save` */
 
 static char s_line[128];
 static size_t s_line_len;
+
+/* last scan results, for `join <n>` */
+static wifi_ap_record_t s_scan[MAX_SCAN];
+static int s_scan_count;
+static bool s_scan_running;
+
+static esp_timer_handle_t s_dbg_timer;
 
 static void con_puts(const char *s)
 {
@@ -49,55 +74,179 @@ static void con_printf(const char *fmt, ...)
     con_puts(buf);
 }
 
-void creds_load(char *ssid, size_t ssid_sz, char *pass, size_t pass_sz)
+/* Diagnostics from the bridge (association edges) and the periodic stats
+ * line; interleaved on the single console, prefixed and gated on the flag. */
+void console_debug_printf(const char *fmt, ...)
 {
-    ssid[0] = pass[0] = '\0';
+    if (!s_cfg.debug) {
+        return;
+    }
+    char buf[192] = "dbg: ";
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf + 5, sizeof(buf) - 7, fmt, ap);
+    va_end(ap);
+    strlcat(buf, "\r\n", sizeof(buf));
+    con_puts(buf);
+}
+
+/* --- config store ------------------------------------------------------- */
+
+static profile_t *active_profile(void)
+{
+    return &s_cfg.p[s_cfg.active];
+}
+
+static int profile_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_PROFILES; i++) {
+        if (s_cfg.p[i].ssid[0]) {
+            n++;
+        }
+    }
+    return n;
+}
+
+static void cfg_load(void)
+{
+    memset(&s_cfg, 0, sizeof(s_cfg));
+    s_cfg.magic = CFG_MAGIC;
+
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
-        size_t n = ssid_sz;
-        if (nvs_get_str(h, "ssid", ssid, &n) != ESP_OK) {
-            ssid[0] = '\0';
+        size_t n = sizeof(s_cfg);
+        cfg_blob_t tmp;
+        if (nvs_get_blob(h, "cfg", &tmp, &n) == ESP_OK &&
+            n == sizeof(tmp) && tmp.magic == CFG_MAGIC) {
+            s_cfg = tmp;
+            if (s_cfg.active >= MAX_PROFILES) {
+                s_cfg.active = 0;
+            }
+            nvs_close(h);
+            return;
         }
-        n = pass_sz;
-        if (nvs_get_str(h, "pass", pass, &n) != ESP_OK) {
-            pass[0] = '\0';
+        /* migration: the pre-profile firmware stored plain ssid/pass keys */
+        n = sizeof(s_cfg.p[0].ssid);
+        if (nvs_get_str(h, "ssid", s_cfg.p[0].ssid, &n) == ESP_OK) {
+            n = sizeof(s_cfg.p[0].pass);
+            if (nvs_get_str(h, "pass", s_cfg.p[0].pass, &n) != ESP_OK) {
+                s_cfg.p[0].pass[0] = '\0';
+            }
+            nvs_close(h);
+            return;
         }
         nvs_close(h);
     }
-    if (ssid[0] == '\0') { /* never provisioned: compile-time fallback */
-        strlcpy(ssid, CONFIG_ESP_WIFI_SSID, ssid_sz);
-        strlcpy(pass, CONFIG_ESP_WIFI_PASSWORD, pass_sz);
-    }
+    /* never provisioned: compile-time fallback */
+    strlcpy(s_cfg.p[0].ssid, CONFIG_ESP_WIFI_SSID, sizeof(s_cfg.p[0].ssid));
+    strlcpy(s_cfg.p[0].pass, CONFIG_ESP_WIFI_PASSWORD, sizeof(s_cfg.p[0].pass));
 }
 
-static esp_err_t creds_save(void)
+static esp_err_t cfg_save(void)
 {
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (err != ESP_OK) {
         return err;
     }
+    err = nvs_set_blob(h, "cfg", &s_cfg, sizeof(s_cfg));
     if (err == ESP_OK) {
-        err = nvs_set_str(h, "ssid", s_ssid);
-    }
-    if (err == ESP_OK) {
-        err = nvs_set_str(h, "pass", s_pass);
-    }
-    if (err == ESP_OK) {
+        nvs_erase_key(h, "ssid"); /* drop migrated legacy keys, if any */
+        nvs_erase_key(h, "pass");
         err = nvs_commit(h);
     }
     nvs_close(h);
     return err;
 }
 
-static void creds_clear_nvs(void)
+void creds_load(char *ssid, size_t ssid_sz, char *pass, size_t pass_sz)
 {
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_erase_all(h);
-        nvs_commit(h);
-        nvs_close(h);
+    cfg_load();
+    strlcpy(ssid, active_profile()->ssid, ssid_sz);
+    strlcpy(pass, active_profile()->pass, pass_sz);
+}
+
+/* --- debug stats stream ------------------------------------------------- */
+
+static void dbg_timer_cb(void *arg)
+{
+    bridge_stats_t st;
+    bridge_get_stats(&st);
+    uint8_t ip4[4];
+    char ips[16] = "none";
+    if (bridge_host_ipv4(ip4)) {
+        snprintf(ips, sizeof(ips), "%u.%u.%u.%u", ip4[0], ip4[1], ip4[2], ip4[3]);
     }
+    console_debug_printf("stats: ->wifi=%lu ->host=%lu txdrop=%lu refl=%lu poolfail=%lu "
+                         "link=%s freeram=%lu host=%s",
+                         (unsigned long)st.host_to_wifi, (unsigned long)st.wifi_to_host,
+                         (unsigned long)st.txdrop, (unsigned long)st.reflected,
+                         (unsigned long)st.poolfail, bridge_link_status(),
+                         (unsigned long)esp_get_free_heap_size(), ips);
+}
+
+static void dbg_set(bool on)
+{
+    s_cfg.debug = on;
+    if (on) {
+        esp_timer_start_periodic(s_dbg_timer, 2 * 1000 * 1000);
+    } else {
+        esp_timer_stop(s_dbg_timer);
+    }
+}
+
+/* --- scan --------------------------------------------------------------- */
+
+static const char *auth_str(wifi_auth_mode_t m)
+{
+    return m == WIFI_AUTH_OPEN ? "open" : "";
+}
+
+static void scan_done_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (!s_scan_running) {
+        return; /* a scan we did not start */
+    }
+    s_scan_running = false;
+    uint16_t n = MAX_SCAN;
+    if (esp_wifi_scan_get_ap_records(&n, s_scan) != ESP_OK) {
+        con_puts("\r\n[!] scan failed\r\n");
+        s_scan_count = 0;
+        return;
+    }
+    s_scan_count = n;
+    con_printf("\r\n    networks (%d):\r\n", s_scan_count);
+    for (int i = 0; i < s_scan_count; i++) {
+        con_printf("      %2d  %-24.24s %4d dBm  %02x:%02x:%02x:%02x:%02x:%02x  %s\r\n",
+                   i + 1, (const char *)s_scan[i].ssid, s_scan[i].rssi,
+                   s_scan[i].bssid[0], s_scan[i].bssid[1], s_scan[i].bssid[2],
+                   s_scan[i].bssid[3], s_scan[i].bssid[4], s_scan[i].bssid[5],
+                   auth_str(s_scan[i].authmode));
+    }
+    con_puts("    join <n> to stage a network\r\n(set|scan|list|use|save) # ");
+}
+
+static void scan_start(void)
+{
+    /* Asynchronous foreground scan: works while associated, and returning
+     * immediately keeps the TinyUSB task (our caller) unblocked. */
+    wifi_scan_config_t cfg = { .show_hidden = false };
+    esp_err_t err = esp_wifi_scan_start(&cfg, false);
+    if (err != ESP_OK) {
+        con_printf("[!] scan failed to start (%s)\r\n", esp_err_to_name(err));
+        return;
+    }
+    s_scan_running = true;
+    con_puts("[*] scanning...\r\n");
+}
+
+/* --- commands ----------------------------------------------------------- */
+
+static void apply_active(void)
+{
+    con_puts("[*] applying -- re-associating\r\n");
+    wifi_apply_creds(active_profile()->ssid, active_profile()->pass);
 }
 
 static void show_state(void)
@@ -107,11 +256,15 @@ static void show_state(void)
     uint8_t mac[6];
     bridge_get_mac(mac);
 
-    con_printf("    ssid:      %s\r\n", s_ssid[0] ? s_ssid : "(unset)");
-    con_printf("    pass:      %s\r\n", s_pass[0] ? "set" : "unset (open)");
+    con_printf("    profiles:  %d saved (active: %d)\r\n", profile_count(),
+               active_profile()->ssid[0] ? s_cfg.active + 1 : 0);
+    con_printf("    ssid:      %s\r\n",
+               active_profile()->ssid[0] ? active_profile()->ssid : "(unset)");
+    con_printf("    pass:      %s\r\n", active_profile()->pass[0] ? "set" : "unset (open)");
+    con_printf("    debug:     %s\r\n", s_cfg.debug ? "on" : "off");
     con_printf("    status:    %s\r\n",
                bridge_wifi_connected() ? "associated"
-               : (s_ssid[0] ? "associating" : "unprovisioned"));
+               : (active_profile()->ssid[0] ? bridge_link_status() : "unprovisioned"));
     con_printf("    mac:       %02x:%02x:%02x:%02x:%02x:%02x (host adopts it)\r\n",
                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
@@ -131,26 +284,60 @@ static void show_state(void)
     } else {
         con_puts("    host IPv6: (not seen yet)\r\n");
     }
-    con_printf("    stats:     ->wifi=%lu ->host=%lu txdrop=%lu refl=%lu\r\n",
+    con_printf("    stats:     ->wifi=%lu ->host=%lu txdrop=%lu refl=%lu poolfail=%lu\r\n",
                (unsigned long)st.host_to_wifi, (unsigned long)st.wifi_to_host,
-               (unsigned long)st.txdrop, (unsigned long)st.reflected);
+               (unsigned long)st.txdrop, (unsigned long)st.reflected,
+               (unsigned long)st.poolfail);
 }
 
-static void prompt(void)
+static void list_profiles(void)
 {
-    con_puts("(set|show|save|clear) # ");
+    con_printf("    profiles (%d/%d):\r\n", profile_count(), MAX_PROFILES);
+    for (int i = 0; i < MAX_PROFILES; i++) {
+        if (s_cfg.p[i].ssid[0]) {
+            con_printf("      %d%c %s%s\r\n", i + 1, i == s_cfg.active ? '*' : ' ',
+                       s_cfg.p[i].ssid, s_cfg.p[i].pass[0] ? "" : "  (open)");
+        }
+    }
+    con_puts("    (* = active)\r\n");
 }
 
-static void banner(void)
+/* Stage `ssid` as the active profile: reuse a profile that already has this
+ * SSID, else the active slot if empty, else the first free slot. */
+static void stage_ssid(const char *ssid)
 {
-    con_puts("\r\n-- esp32-usb-eth --\r\n");
-    show_state();
-    prompt();
+    int slot = -1;
+    for (int i = 0; i < MAX_PROFILES; i++) {
+        if (strcmp(s_cfg.p[i].ssid, ssid) == 0) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0 && !active_profile()->ssid[0]) {
+        slot = s_cfg.active;
+    }
+    if (slot < 0) {
+        for (int i = 0; i < MAX_PROFILES; i++) {
+            if (!s_cfg.p[i].ssid[0]) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot < 0) {
+        con_puts("[!] all profile slots full; del one first\r\n");
+        return;
+    }
+    if (strcmp(s_cfg.p[slot].ssid, ssid) != 0) {
+        strlcpy(s_cfg.p[slot].ssid, ssid, sizeof(s_cfg.p[slot].ssid));
+        s_cfg.p[slot].pass[0] = '\0';
+    }
+    s_cfg.active = slot;
+    apply_active();
 }
 
 static void handle_line(char *line)
 {
-    /* strip leading spaces */
     while (*line == ' ') {
         line++;
     }
@@ -159,27 +346,83 @@ static void handle_line(char *line)
     }
 
     if (strcmp(line, "help") == 0) {
-        con_puts("    set ssid <text>   set SSID and re-associate\r\n"
-                 "    set pass <text>   set passphrase (blank for open) and re-associate\r\n"
-                 "    show              show state\r\n"
-                 "    save              persist credentials to NVS\r\n"
-                 "    clear             erase saved credentials\r\n"
-                 "    reboot            restart the device\r\n");
+        con_puts("    set ssid <text>    set the active profile's SSID and re-associate\r\n"
+                 "    set pass <text>    set its passphrase (blank for open) and re-associate\r\n"
+                 "    set debug <on|off> stream diagnostics on this console\r\n"
+                 "    show               show state\r\n"
+                 "    scan               scan for networks; join <n> stages one\r\n"
+                 "    list               list saved profiles\r\n"
+                 "    use <n>            make profile n active and re-associate\r\n"
+                 "    del <n>            delete profile n\r\n"
+                 "    save               persist profiles and settings to NVS\r\n"
+                 "    clear              erase everything saved\r\n"
+                 "    reboot             restart the device\r\n");
     } else if (strcmp(line, "show") == 0) {
         show_state();
+    } else if (strcmp(line, "list") == 0) {
+        list_profiles();
+    } else if (strcmp(line, "scan") == 0) {
+        scan_start();
+    } else if (strncmp(line, "join ", 5) == 0) {
+        int n = atoi(line + 5);
+        if (n < 1 || n > s_scan_count) {
+            con_puts("[!] no such scan entry (run scan first)\r\n");
+        } else {
+            stage_ssid((const char *)s_scan[n - 1].ssid);
+            if (s_scan[n - 1].authmode != WIFI_AUTH_OPEN && !active_profile()->pass[0]) {
+                con_puts("[*] staged -- set pass <password> then save\r\n");
+            }
+        }
+    } else if (strncmp(line, "use ", 4) == 0) {
+        int n = atoi(line + 4);
+        if (n < 1 || n > MAX_PROFILES || !s_cfg.p[n - 1].ssid[0]) {
+            con_puts("[!] no such profile\r\n");
+        } else {
+            s_cfg.active = n - 1;
+            apply_active();
+        }
+    } else if (strncmp(line, "del ", 4) == 0) {
+        int n = atoi(line + 4);
+        if (n < 1 || n > MAX_PROFILES || !s_cfg.p[n - 1].ssid[0]) {
+            con_puts("[!] no such profile\r\n");
+        } else {
+            memset(&s_cfg.p[n - 1], 0, sizeof(profile_t));
+            if (s_cfg.active == n - 1) { /* deleted the active one: pick first used */
+                s_cfg.active = 0;
+                for (int i = 0; i < MAX_PROFILES; i++) {
+                    if (s_cfg.p[i].ssid[0]) {
+                        s_cfg.active = i;
+                        break;
+                    }
+                }
+                apply_active();
+            }
+            con_puts("[*] deleted (save to persist)\r\n");
+        }
     } else if (strncmp(line, "set ssid", 8) == 0 && (line[8] == ' ' || line[8] == '\0')) {
-        strlcpy(s_ssid, line[8] ? line + 9 : "", sizeof(s_ssid));
-        con_puts("[*] applying -- re-associating\r\n");
-        wifi_apply_creds(s_ssid, s_pass);
+        strlcpy(active_profile()->ssid, line[8] ? line + 9 : "",
+                sizeof(active_profile()->ssid));
+        apply_active();
     } else if (strncmp(line, "set pass", 8) == 0 && (line[8] == ' ' || line[8] == '\0')) {
-        strlcpy(s_pass, line[8] ? line + 9 : "", sizeof(s_pass));
-        con_puts("[*] applying -- re-associating\r\n");
-        wifi_apply_creds(s_ssid, s_pass);
+        strlcpy(active_profile()->pass, line[8] ? line + 9 : "",
+                sizeof(active_profile()->pass));
+        apply_active();
+    } else if (strcmp(line, "set debug on") == 0) {
+        dbg_set(true);
+        con_puts("[*] debug stream on (save to persist)\r\n");
+    } else if (strcmp(line, "set debug off") == 0) {
+        dbg_set(false);
+        con_puts("[*] debug stream off\r\n");
     } else if (strcmp(line, "save") == 0) {
-        con_puts(creds_save() == ESP_OK ? "[*] saved to NVS\r\n" : "[!] save failed\r\n");
+        con_puts(cfg_save() == ESP_OK ? "[*] saved to NVS\r\n" : "[!] save failed\r\n");
     } else if (strcmp(line, "clear") == 0) {
-        creds_clear_nvs();
-        con_puts("[*] saved credentials erased (running config unchanged)\r\n");
+        nvs_handle_t h;
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_erase_all(h);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+        con_puts("[*] saved config erased (running config unchanged)\r\n");
     } else if (strcmp(line, "reboot") == 0) {
         con_puts("[*] rebooting\r\n");
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -187,6 +430,20 @@ static void handle_line(char *line)
     } else {
         con_puts("[!] unknown command; try help\r\n");
     }
+}
+
+/* --- CDC plumbing ------------------------------------------------------- */
+
+static void prompt(void)
+{
+    con_puts("(set|scan|list|use|save) # ");
+}
+
+static void banner(void)
+{
+    con_puts("\r\n-- esp32-usb-eth --\r\n");
+    show_state();
+    prompt();
 }
 
 static void cdc_rx_cb(int itf, cdcacm_event_t *event)
@@ -232,8 +489,7 @@ static void cdc_line_state_cb(int itf, cdcacm_event_t *event)
 
 void console_init(void)
 {
-    /* seed the working copy with whatever the bridge booted with */
-    creds_load(s_ssid, sizeof(s_ssid), s_pass, sizeof(s_pass));
+    /* creds_load() (called by app_main before this) already loaded s_cfg */
 
     const tinyusb_config_cdcacm_t acm_cfg = {
         .cdc_port = TINYUSB_CDC_ACM_0,
@@ -241,5 +497,17 @@ void console_init(void)
         .callback_line_state_changed = cdc_line_state_cb,
     };
     ESP_ERROR_CHECK(tinyusb_cdcacm_init(&acm_cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE,
+                                               scan_done_handler, NULL));
+
+    const esp_timer_create_args_t targs = {
+        .callback = dbg_timer_cb,
+        .name = "dbgstats",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&targs, &s_dbg_timer));
+    if (s_cfg.debug) {
+        dbg_set(true);
+    }
     ESP_LOGI(TAG, "management console on CDC-ACM 0");
 }

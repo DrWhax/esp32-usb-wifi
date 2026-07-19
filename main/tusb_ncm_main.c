@@ -18,6 +18,7 @@
 #include "nvs_flash.h"
 #include "esp_mac.h"
 
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_private/wifi.h"
 
@@ -40,6 +41,10 @@ static volatile uint32_t s_cnt_host_to_wifi;
 static volatile uint32_t s_cnt_wifi_to_host;
 static volatile uint32_t s_cnt_txdrop;
 static volatile uint32_t s_cnt_reflected;
+static volatile uint32_t s_cnt_poolfail;
+
+static uint8_t s_last_disc_reason;    /* wifi_err_reason_t of the last disconnect */
+static esp_timer_handle_t s_retry_timer; /* paced re-join, instead of a tight loop */
 
 /* Host addresses, snooped passively from host -> Wi-Fi frames: the bridge
  * holds no IP, so this is the only way the console can report what address
@@ -79,8 +84,11 @@ static esp_err_t usb_recv_callback(void *buffer, uint16_t len, void *ctx)
 {
     snoop_host_addr(buffer, len);
     if (s_is_wifi_connected) {
-        esp_wifi_internal_tx(ESP_IF_WIFI_STA, buffer, len);
-        s_cnt_host_to_wifi++;
+        if (esp_wifi_internal_tx(ESP_IF_WIFI_STA, buffer, len) == ESP_OK) {
+            s_cnt_host_to_wifi++;
+        } else {
+            s_cnt_poolfail++; /* driver out of TX buffers; the host retries */
+        }
     } else {
         s_cnt_txdrop++; /* not associated; the host retries */
     }
@@ -111,20 +119,34 @@ static esp_err_t pkt_wifi2usb(void *buffer, uint16_t len, void *eb)
     return ESP_OK;
 }
 
+static void retry_timer_cb(void *arg)
+{
+    if (!s_is_wifi_connected && s_ssid[0]) {
+        esp_wifi_connect();
+    }
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGI(TAG, "WiFi STA disconnected");
+        wifi_event_sta_disconnected_t *d = event_data;
+        s_last_disc_reason = d->reason;
+        ESP_LOGI(TAG, "WiFi STA disconnected (reason %d)", d->reason);
+        if (s_is_wifi_connected) {
+            console_debug_printf("Wi-Fi link down (reason %d)", d->reason);
+        }
         s_is_wifi_connected = false;
         esp_wifi_internal_reg_rxcb(ESP_IF_WIFI_STA, NULL);
-        if (s_ssid[0]) { /* re-join, unless unprovisioned */
-            esp_wifi_connect();
+        if (s_ssid[0]) { /* paced re-join, unless unprovisioned */
+            esp_timer_start_once(s_retry_timer, 5 * 1000 * 1000);
         }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
         ESP_LOGI(TAG, "WiFi STA connected");
         esp_wifi_internal_reg_rxcb(ESP_IF_WIFI_STA, pkt_wifi2usb);
         s_is_wifi_connected = true;
+        s_last_disc_reason = 0;
+        console_debug_printf("associated to %s", s_ssid);
     }
 }
 
@@ -148,6 +170,25 @@ void bridge_get_stats(bridge_stats_t *s)
     s->wifi_to_host = s_cnt_wifi_to_host;
     s->txdrop = s_cnt_txdrop;
     s->reflected = s_cnt_reflected;
+    s->poolfail = s_cnt_poolfail;
+}
+
+const char *bridge_link_status(void)
+{
+    if (s_is_wifi_connected) {
+        return "up";
+    }
+    switch (s_last_disc_reason) {
+        case WIFI_REASON_NO_AP_FOUND:
+            return "nonet";
+        case WIFI_REASON_AUTH_FAIL:
+        case WIFI_REASON_AUTH_EXPIRE:
+        case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+        case WIFI_REASON_HANDSHAKE_TIMEOUT:
+            return "badauth";
+        default:
+            return "join";
+    }
 }
 
 void bridge_get_mac(uint8_t mac[6])
@@ -182,10 +223,13 @@ void wifi_apply_creds(const char *ssid, const char *pass)
 {
     strlcpy(s_ssid, ssid, sizeof(s_ssid));
     strlcpy(s_pass, pass, sizeof(s_pass));
-    esp_wifi_disconnect(); /* handler re-joins with the new config, if provisioned */
+    esp_timer_stop(s_retry_timer); /* a pending retry would race the new config */
+    esp_wifi_disconnect();
     wifi_set_config_from_creds();
-    if (s_ssid[0] && !s_is_wifi_connected) {
-        esp_wifi_connect(); /* not associated: the disconnect event may not fire */
+    if (s_ssid[0]) {
+        /* Join now; if this races the in-flight disconnect and fails, the
+         * disconnect handler's retry timer re-joins within 5 s. */
+        esp_wifi_connect();
     }
 }
 
@@ -236,10 +280,17 @@ void app_main(void)
              s_mac[0], s_mac[1], s_mac[2], s_mac[3], s_mac[4], s_mac[5]);
     ESP_GOTO_ON_ERROR(tinyusb_net_init(&net_config), err, TAG, "Failed to initialize TinyUSB NCM device class");
 
-    console_init();
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    const esp_timer_create_args_t targs = {
+        .callback = retry_timer_cb,
+        .name = "wifi_retry",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&targs, &s_retry_timer));
+
+    console_init(); /* needs the event loop (scan-done handler) */
 
     ESP_LOGI(TAG, "WiFi initialization");
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_GOTO_ON_ERROR(start_wifi(), err, TAG, "Failed to init and start WiFi");
 
     ESP_LOGI(TAG, "USB NCM and WiFi initialized and started");
