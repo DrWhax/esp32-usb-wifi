@@ -401,7 +401,8 @@ static void handle_line(char *line)
                  "    del <n>            delete profile n\r\n"
                  "    save               persist profiles and settings to NVS\r\n"
                  "    clear              erase everything saved\r\n"
-                 "    reboot             restart the device\r\n");
+                 "    reboot             restart the device\r\n"
+                 "    crash | hang       recovery self-test: fault or hang on purpose\r\n");
     } else if (strcmp(line, "show") == 0) {
         show_state();
     } else if (strcmp(line, "list") == 0) {
@@ -503,6 +504,23 @@ static void handle_line(char *line)
         con_puts("[*] rebooting\r\n");
         vTaskDelay(pdMS_TO_TICKS(100));
         esp_restart();
+    } else if (strcmp(line, "crash") == 0) {
+        /* recovery self-test: a real StoreProhibited panic. Expect the device
+         * to re-enumerate in a few seconds and `show` to report
+         * "RECOVERED from panic" with faults incremented. */
+        con_puts("[*] deliberately faulting -- device will drop and recover on its own\r\n");
+        vTaskDelay(pdMS_TO_TICKS(150)); /* let the reply reach the host */
+        volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)atoi("0");
+        *p = 0xdeadbeef; /* not reached: panic -> reboot -> crashlog counts it */
+    } else if (strcmp(line, "hang") == 0) {
+        /* recovery self-test: spin in the TinyUSB task so the idle task
+         * starves and the task watchdog panics (~5 s). Expect
+         * "RECOVERED from watchdog" with hangs incremented. */
+        con_puts("[*] deliberately hanging -- watchdog reboots in ~5 s\r\n");
+        vTaskDelay(pdMS_TO_TICKS(150));
+        for (;;) {
+            __asm__ volatile("" ::: "memory");
+        }
     } else {
         con_puts("[!] unknown command; try help\r\n");
     }

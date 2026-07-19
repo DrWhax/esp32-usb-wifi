@@ -93,6 +93,11 @@ recoveries, `faults` are panic recoveries. A cold power-on (replug) resets all
 three — that is how you distinguish "recovered overnight" from "freshly
 plugged in".
 
+The path is self-testable: `crash` on the console faults on purpose (panic →
+`faults`), `hang` spins until the task watchdog fires (~5 s → `hangs`). Either
+way the device drops off USB, reboots, re-enumerates, and re-associates by
+itself — no replug — and the next `show` carries the RECOVERED report.
+
 ## Status LED
 
 The board's WS2812 LED mirrors the pico firmware's states:
