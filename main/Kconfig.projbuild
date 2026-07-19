@@ -12,4 +12,12 @@ menu "Example Configuration"
         help
             WiFi password (WPA or WPA2) for the example to use.
 
+    config BRIDGE_LED_GPIO
+        int "Status LED (WS2812) GPIO"
+        default 48
+        help
+            Data pin of the devkit's WS2812 status LED. 48 on
+            ESP32-S3-DevKitC-1 v1.0, 38 on v1.1. The firmware runs fine
+            if no LED is attached.
+
 endmenu

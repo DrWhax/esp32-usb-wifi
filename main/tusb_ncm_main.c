@@ -18,6 +18,7 @@
 #include "nvs_flash.h"
 #include "esp_mac.h"
 
+#include "esp_attr.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_private/wifi.h"
@@ -45,6 +46,67 @@ static volatile uint32_t s_cnt_poolfail;
 
 static uint8_t s_last_disc_reason;    /* wifi_err_reason_t of the last disconnect */
 static esp_timer_handle_t s_retry_timer; /* paced re-join, instead of a tight loop */
+
+/* Crash telemetry. RTC slow memory is not cleared on a warm reset (panic or
+ * watchdog), so on recovery these fields still hold the tallies and the
+ * counter snapshot from just before the crash; a cold power-on leaves the
+ * region indeterminate, which the magic word detects. A 1 s timer refreshes
+ * the snapshot while the firmware is healthy. */
+#define CRASHLOG_MAGIC 0x45555746u /* "EUWF" */
+typedef struct {
+    uint32_t magic;
+    uint32_t boots, hangs, faults;
+    uint32_t host_to_wifi, wifi_to_host, txdrop, reflected, poolfail;
+} crashlog_t;
+static RTC_NOINIT_ATTR crashlog_t s_crashlog;
+static bridge_crash_info_t s_crash; /* boot-time evaluation, served to the console */
+static esp_timer_handle_t s_snapshot_timer;
+
+static void snapshot_timer_cb(void *arg)
+{
+    s_crashlog.host_to_wifi = s_cnt_host_to_wifi;
+    s_crashlog.wifi_to_host = s_cnt_wifi_to_host;
+    s_crashlog.txdrop = s_cnt_txdrop;
+    s_crashlog.reflected = s_cnt_reflected;
+    s_crashlog.poolfail = s_cnt_poolfail;
+}
+
+static void crashlog_boot(void)
+{
+    esp_reset_reason_t rr = esp_reset_reason();
+    bool warm = (s_crashlog.magic == CRASHLOG_MAGIC);
+    if (!warm) {
+        memset(&s_crashlog, 0, sizeof(s_crashlog));
+        s_crashlog.magic = CRASHLOG_MAGIC;
+    } else {
+        s_crash.pre.host_to_wifi = s_crashlog.host_to_wifi;
+        s_crash.pre.wifi_to_host = s_crashlog.wifi_to_host;
+        s_crash.pre.txdrop = s_crashlog.txdrop;
+        s_crash.pre.reflected = s_crashlog.reflected;
+        s_crash.pre.poolfail = s_crashlog.poolfail;
+        if (rr == ESP_RST_PANIC) {
+            s_crashlog.faults++;
+            s_crash.recovered = "panic";
+        } else if (rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT || rr == ESP_RST_WDT) {
+            s_crashlog.hangs++;
+            s_crash.recovered = "watchdog";
+        }
+    }
+    s_crashlog.boots++;
+    s_crash.boots = s_crashlog.boots;
+    s_crash.hangs = s_crashlog.hangs;
+    s_crash.faults = s_crashlog.faults;
+    if (s_crash.recovered) {
+        ESP_LOGW(TAG, "RECOVERED from %s (boot #%lu, hangs=%lu faults=%lu)",
+                 s_crash.recovered, (unsigned long)s_crash.boots,
+                 (unsigned long)s_crash.hangs, (unsigned long)s_crash.faults);
+    }
+}
+
+void bridge_get_crash(bridge_crash_info_t *c)
+{
+    *c = s_crash;
+}
 
 /* Host addresses, snooped passively from host -> Wi-Fi frames: the bridge
  * holds no IP, so this is the only way the console can report what address
@@ -255,6 +317,8 @@ static esp_err_t start_wifi(void)
 
 void app_main(void)
 {
+    crashlog_boot();
+
     /* Initialize NVS — PHY calibration data and the credential store */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -288,10 +352,21 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(esp_timer_create(&targs, &s_retry_timer));
 
+    const esp_timer_create_args_t snap_args = {
+        .callback = snapshot_timer_cb,
+        .name = "crashsnap",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&snap_args, &s_snapshot_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(s_snapshot_timer, 1000 * 1000));
+
     console_init(); /* needs the event loop (scan-done handler) */
+    led_init();
 
     ESP_LOGI(TAG, "WiFi initialization");
     ESP_GOTO_ON_ERROR(start_wifi(), err, TAG, "Failed to init and start WiFi");
+    if (cfg_country()[0]) {
+        esp_wifi_set_country_code(cfg_country(), true);
+    }
 
     ESP_LOGI(TAG, "USB NCM and WiFi initialized and started");
     return;

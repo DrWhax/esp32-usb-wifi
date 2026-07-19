@@ -22,6 +22,20 @@ bool bridge_wifi_connected(void);
  * "badauth" (wrong passphrase), "nonet" (SSID not found), or "join". */
 const char *bridge_link_status(void);
 
+/* Crash telemetry that survives warm reboots (RTC noinit RAM). */
+typedef struct {
+    uint32_t boots;          /* boots since the last cold power-on */
+    uint32_t hangs;          /* watchdog-reset recoveries since cold power-on */
+    uint32_t faults;         /* panic recoveries since cold power-on */
+    const char *recovered;   /* how this boot recovered ("panic", "watchdog"), or NULL */
+    bridge_stats_t pre;      /* counters snapshotted just before the crash */
+} bridge_crash_info_t;
+
+void bridge_get_crash(bridge_crash_info_t *c);
+
+/* Regulatory country as saved in the config ("" = driver default). */
+const char *cfg_country(void);
+
 /* Host addresses snooped passively from host -> Wi-Fi frames (the bridge holds
  * no IP of its own). Return false while nothing has been seen yet. */
 bool bridge_host_ipv4(uint8_t ip[4]);
@@ -37,3 +51,7 @@ void console_init(void);
 void creds_load(char *ssid, size_t ssid_sz, char *pass, size_t pass_sz);
 /* Diagnostics line on the console's debug stream; no-op unless debug is on. */
 void console_debug_printf(const char *fmt, ...);
+
+/* led.c — status patterns on the devkit's WS2812 (pico LED-state parity). */
+void led_init(void);
+void led_set_provisioned(bool have_ssid);

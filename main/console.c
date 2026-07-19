@@ -10,10 +10,12 @@
  * esp_timer. Commands are short and NVS writes take a few ms, which the
  * bridge tolerates. */
 
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -30,7 +32,8 @@
 static const char *TAG = "console";
 
 #define NVS_NAMESPACE "wificfg"
-#define CFG_MAGIC 0x45555731u /* "EUW1" */
+#define CFG_MAGIC_V1 0x45555731u /* "EUW1": no country field */
+#define CFG_MAGIC 0x45555732u    /* "EUW2" */
 #define MAX_PROFILES 8
 #define MAX_SCAN 20
 
@@ -43,6 +46,14 @@ typedef struct {
     uint32_t magic;
     uint8_t active; /* index into p[] */
     uint8_t debug;
+    profile_t p[MAX_PROFILES];
+} cfg_blob_v1_t;
+
+typedef struct {
+    uint32_t magic;
+    uint8_t active; /* index into p[] */
+    uint8_t debug;
+    char country[3]; /* "" = driver default; "01" = world-safe */
     profile_t p[MAX_PROFILES];
 } cfg_blob_t;
 
@@ -115,16 +126,26 @@ static void cfg_load(void)
 
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
-        size_t n = sizeof(s_cfg);
-        cfg_blob_t tmp;
-        if (nvs_get_blob(h, "cfg", &tmp, &n) == ESP_OK &&
-            n == sizeof(tmp) && tmp.magic == CFG_MAGIC) {
-            s_cfg = tmp;
+        union {
+            cfg_blob_t v2;
+            cfg_blob_v1_t v1;
+        } tmp;
+        size_t n = sizeof(tmp);
+        if (nvs_get_blob(h, "cfg", &tmp, &n) == ESP_OK) {
+            if (n == sizeof(cfg_blob_t) && tmp.v2.magic == CFG_MAGIC) {
+                s_cfg = tmp.v2;
+            } else if (n == sizeof(cfg_blob_v1_t) && tmp.v1.magic == CFG_MAGIC_V1) {
+                s_cfg.active = tmp.v1.active; /* v1 record: no country yet */
+                s_cfg.debug = tmp.v1.debug;
+                memcpy(s_cfg.p, tmp.v1.p, sizeof(s_cfg.p));
+            }
             if (s_cfg.active >= MAX_PROFILES) {
                 s_cfg.active = 0;
             }
-            nvs_close(h);
-            return;
+            if (s_cfg.p[0].ssid[0] || profile_count()) {
+                nvs_close(h);
+                return;
+            }
         }
         /* migration: the pre-profile firmware stored plain ssid/pass keys */
         n = sizeof(s_cfg.p[0].ssid);
@@ -165,6 +186,12 @@ void creds_load(char *ssid, size_t ssid_sz, char *pass, size_t pass_sz)
     cfg_load();
     strlcpy(ssid, active_profile()->ssid, ssid_sz);
     strlcpy(pass, active_profile()->pass, pass_sz);
+    led_set_provisioned(active_profile()->ssid[0] != '\0');
+}
+
+const char *cfg_country(void)
+{
+    return s_cfg.country;
 }
 
 /* --- debug stats stream ------------------------------------------------- */
@@ -246,6 +273,7 @@ static void scan_start(void)
 static void apply_active(void)
 {
     con_puts("[*] applying -- re-associating\r\n");
+    led_set_provisioned(active_profile()->ssid[0] != '\0');
     wifi_apply_creds(active_profile()->ssid, active_profile()->pass);
 }
 
@@ -261,6 +289,9 @@ static void show_state(void)
     con_printf("    ssid:      %s\r\n",
                active_profile()->ssid[0] ? active_profile()->ssid : "(unset)");
     con_printf("    pass:      %s\r\n", active_profile()->pass[0] ? "set" : "unset (open)");
+    con_printf("    country:   %s\r\n", s_cfg.country[0]
+               ? (strcmp(s_cfg.country, "01") == 0 ? "WORLDWIDE" : s_cfg.country)
+               : "(unset)");
     con_printf("    debug:     %s\r\n", s_cfg.debug ? "on" : "off");
     con_printf("    status:    %s\r\n",
                bridge_wifi_connected() ? "associated"
@@ -288,6 +319,18 @@ static void show_state(void)
                (unsigned long)st.host_to_wifi, (unsigned long)st.wifi_to_host,
                (unsigned long)st.txdrop, (unsigned long)st.reflected,
                (unsigned long)st.poolfail);
+
+    bridge_crash_info_t ci;
+    bridge_get_crash(&ci);
+    con_printf("    health:    boots=%lu hangs=%lu faults=%lu\r\n",
+               (unsigned long)ci.boots, (unsigned long)ci.hangs, (unsigned long)ci.faults);
+    if (ci.recovered) {
+        con_printf("    RECOVERED from %s this boot; pre-crash ->wifi=%lu ->host=%lu "
+                   "txdrop=%lu refl=%lu poolfail=%lu\r\n", ci.recovered,
+                   (unsigned long)ci.pre.host_to_wifi, (unsigned long)ci.pre.wifi_to_host,
+                   (unsigned long)ci.pre.txdrop, (unsigned long)ci.pre.reflected,
+                   (unsigned long)ci.pre.poolfail);
+    }
 }
 
 static void list_profiles(void)
@@ -348,6 +391,7 @@ static void handle_line(char *line)
     if (strcmp(line, "help") == 0) {
         con_puts("    set ssid <text>    set the active profile's SSID and re-associate\r\n"
                  "    set pass <text>    set its passphrase (blank for open) and re-associate\r\n"
+                 "    set country <CC|WORLDWIDE>  set the regulatory country\r\n"
                  "    set debug <on|off> stream diagnostics on this console\r\n"
                  "    show               show state\r\n"
                  "    scan               scan for networks; join <n> stages one\r\n"
@@ -407,6 +451,21 @@ static void handle_line(char *line)
         strlcpy(active_profile()->pass, line[8] ? line + 9 : "",
                 sizeof(active_profile()->pass));
         apply_active();
+    } else if (strncmp(line, "set country ", 12) == 0) {
+        const char *cc = line + 12;
+        if (strcasecmp(cc, "WORLDWIDE") == 0) {
+            cc = "01";
+        }
+        if (strlen(cc) != 2) {
+            con_puts("[!] usage: set country <CC|WORLDWIDE> (two-letter code)\r\n");
+        } else {
+            s_cfg.country[0] = toupper((unsigned char)cc[0]);
+            s_cfg.country[1] = toupper((unsigned char)cc[1]);
+            s_cfg.country[2] = '\0';
+            esp_err_t err = esp_wifi_set_country_code(s_cfg.country, true);
+            con_printf(err == ESP_OK ? "[*] country set (save to persist)\r\n"
+                                     : "[!] rejected: %s\r\n", esp_err_to_name(err));
+        }
     } else if (strcmp(line, "set debug on") == 0) {
         dbg_set(true);
         con_puts("[*] debug stream on (save to persist)\r\n");
