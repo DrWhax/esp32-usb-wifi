@@ -1,4 +1,4 @@
-# esp32-usb-eth
+# esp32-usb-wifi
 
 ESP32-S3 port of [pico-usb-wifi](https://gitlab.com/baiyibai/pico-usb-wifi): a driverless USB Wi-Fi
 adapter (USB CDC-NCM device bridging to a Wi-Fi station).
