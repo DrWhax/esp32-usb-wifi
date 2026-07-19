@@ -11,13 +11,15 @@ kept as `README.upstream.md`), extended per the port plan
 * station MAC adoption + raw L2 forwarding (`esp_wifi_internal_*`, no `esp_netif`)
 * reflection filter (drops the host's own frames echoed back by the AP)
 * host IPv4/IPv6 snooping (the device holds no IP; the console reports the host's)
-* **management console** on CDC-ACM (composite NCM + ACM): `set ssid` /
-  `set pass` apply immediately, `save` persists to NVS — credentials survive
-  reboot and reflash; compile-time creds are only a never-provisioned fallback
+* **management console** on CDC-ACM (composite NCM + ACM): up to 8 credential
+  _profiles_ in NVS (`set ssid`/`set pass` edit the active one, `list`/`use`/`del`
+  manage the set), `scan` + `join <n>` to discover and stage networks, and
+  `set debug on` for a 2 s stats stream (`dbg:`-prefixed) with association
+  events and failure reasons (`badauth`/`nonet`). Changes apply immediately;
+  `save` persists. Compile-time creds are only a never-provisioned fallback
 * `tools/provision.py <ssid> [password]` — scripted provisioning over the console
 
-Not yet ported (see the plan): multi-profile store, scan/join, periodic debug
-stats stream, watchdog/crash telemetry, LED states.
+Not yet ported (see the plan): watchdog/crash telemetry, LED states.
 
 ## Provisioning
 
