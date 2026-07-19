@@ -455,6 +455,7 @@ static void cdc_rx_cb(int itf, cdcacm_event_t *event)
             char c = (char)buf[i];
             if (c == '\r' || c == '\n') {
                 if (s_line_len == 0) {
+                    prompt(); /* bare Enter: reprint the prompt (also lets tools probe for the console) */
                     continue;
                 }
                 con_puts("\r\n");
