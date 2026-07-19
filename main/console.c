@@ -392,6 +392,7 @@ static void handle_line(char *line)
         con_puts("    set ssid <text>    set the active profile's SSID and re-associate\r\n"
                  "    set pass <text>    set its passphrase (blank for open) and re-associate\r\n"
                  "    set country <CC|WORLDWIDE>  set the regulatory country\r\n"
+                 "    set led <gpio>     move the WS2812 status LED pin (38 on v1.1 devkits)\r\n"
                  "    set debug <on|off> stream diagnostics on this console\r\n"
                  "    show               show state\r\n"
                  "    scan               scan for networks; join <n> stages one\r\n"
@@ -451,6 +452,22 @@ static void handle_line(char *line)
         strlcpy(active_profile()->pass, line[8] ? line + 9 : "",
                 sizeof(active_profile()->pass));
         apply_active();
+    } else if (strncmp(line, "set led ", 8) == 0) {
+        int gpio = atoi(line + 8);
+        if (gpio < 0 || gpio > 48) {
+            con_puts("[!] usage: set led <gpio 0-48>\r\n");
+        } else if (!led_set_gpio(gpio)) {
+            con_printf("[!] could not drive GPIO%d\r\n", gpio);
+        } else {
+            /* persist immediately: hardware config, not a credential edit */
+            nvs_handle_t h;
+            if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+                nvs_set_u8(h, "ledgpio", (uint8_t)gpio);
+                nvs_commit(h);
+                nvs_close(h);
+            }
+            con_printf("[*] LED on GPIO%d (persisted) -- solid/blinking if that's the right pin\r\n", gpio);
+        }
     } else if (strncmp(line, "set country ", 12) == 0) {
         const char *cc = line + 12;
         if (strcasecmp(cc, "WORLDWIDE") == 0) {

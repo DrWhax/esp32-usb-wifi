@@ -56,3 +56,4 @@ void console_debug_printf(const char *fmt, ...);
 /* led.c — status patterns on the devkit's WS2812 (pico LED-state parity). */
 void led_init(void);
 void led_set_provisioned(bool have_ssid);
+bool led_set_gpio(int gpio); /* re-home the WS2812; false if init failed */
