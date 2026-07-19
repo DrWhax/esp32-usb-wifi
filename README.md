@@ -3,6 +3,8 @@
 ESP32-S3 port of [pico-usb-wifi](https://gitlab.com/baiyibai/pico-usb-wifi): a driverless USB Wi-Fi
 adapter (USB CDC-NCM device bridging to a Wi-Fi station).
 
+Speeds are max USB 2.0 full speed. Speedtests show speeds of roughly 5.7Mbps.
+
 Seeded from Espressif's `tusb_ncm` example (ESP-IDF v5.5,
 `examples/peripherals/usb/device/tusb_ncm`, Unlicense/CC0.
 
@@ -17,9 +19,9 @@ Seeded from Espressif's `tusb_ncm` example (ESP-IDF v5.5,
   `save` persists. Compile-time creds are only a never-provisioned fallback
 * `tools/provision.py <ssid> [password]` — scripted provisioning over the console
 
-Not yet ported (see the plan): watchdog/crash telemetry, LED states.
-
 ## Provisioning
+
+Provisioning is possible through three ways:
 
 ```sh
 . ~/esp/esp-idf/export.sh          # or: pip install pyserial
@@ -27,6 +29,12 @@ tools/provision.py "MyNetwork" "hunter2"
 ```
 
 Or interactively: `picocom /dev/cu.usbmodem1234561` (any baud), then `help`.
+
+Or through a Python TUI.
+
+```
+uv run tools/tui.py
+```
 
 ## Build
 
