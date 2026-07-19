@@ -205,12 +205,12 @@ static void dbg_timer_cb(void *arg)
     if (bridge_host_ipv4(ip4)) {
         snprintf(ips, sizeof(ips), "%u.%u.%u.%u", ip4[0], ip4[1], ip4[2], ip4[3]);
     }
-    console_debug_printf("stats: ->wifi=%lu ->host=%lu txdrop=%lu refl=%lu poolfail=%lu "
-                         "link=%s freeram=%lu host=%s",
+    console_debug_printf("stats: ->wifi=%lu ->host=%lu txdrop=%lu rxdrop=%lu refl=%lu "
+                         "poolfail=%lu link=%s freeram=%lu host=%s",
                          (unsigned long)st.host_to_wifi, (unsigned long)st.wifi_to_host,
-                         (unsigned long)st.txdrop, (unsigned long)st.reflected,
-                         (unsigned long)st.poolfail, bridge_link_status(),
-                         (unsigned long)esp_get_free_heap_size(), ips);
+                         (unsigned long)st.txdrop, (unsigned long)st.rxdrop,
+                         (unsigned long)st.reflected, (unsigned long)st.poolfail,
+                         bridge_link_status(), (unsigned long)esp_get_free_heap_size(), ips);
 }
 
 static void dbg_set(bool on)
@@ -315,10 +315,10 @@ static void show_state(void)
     } else {
         con_puts("    host IPv6: (not seen yet)\r\n");
     }
-    con_printf("    stats:     ->wifi=%lu ->host=%lu txdrop=%lu refl=%lu poolfail=%lu\r\n",
+    con_printf("    stats:     ->wifi=%lu ->host=%lu txdrop=%lu rxdrop=%lu refl=%lu poolfail=%lu\r\n",
                (unsigned long)st.host_to_wifi, (unsigned long)st.wifi_to_host,
-               (unsigned long)st.txdrop, (unsigned long)st.reflected,
-               (unsigned long)st.poolfail);
+               (unsigned long)st.txdrop, (unsigned long)st.rxdrop,
+               (unsigned long)st.reflected, (unsigned long)st.poolfail);
 
     bridge_crash_info_t ci;
     bridge_get_crash(&ci);

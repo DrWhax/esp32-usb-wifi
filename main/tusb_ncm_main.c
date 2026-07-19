@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_check.h"
@@ -43,6 +45,7 @@ static volatile uint32_t s_cnt_wifi_to_host;
 static volatile uint32_t s_cnt_txdrop;
 static volatile uint32_t s_cnt_reflected;
 static volatile uint32_t s_cnt_poolfail;
+static volatile uint32_t s_cnt_rxdrop;
 
 static uint8_t s_last_disc_reason;    /* wifi_err_reason_t of the last disconnect */
 static esp_timer_handle_t s_retry_timer; /* paced re-join, instead of a tight loop */
@@ -52,11 +55,12 @@ static esp_timer_handle_t s_retry_timer; /* paced re-join, instead of a tight lo
  * counter snapshot from just before the crash; a cold power-on leaves the
  * region indeterminate, which the magic word detects. A 1 s timer refreshes
  * the snapshot while the firmware is healthy. */
-#define CRASHLOG_MAGIC 0x45555746u /* "EUWF" */
+#define CRASHLOG_MAGIC 0x45555747u /* "EUWG": bumped when the layout changes,
+                                      so a reflash never misreads stale RTC RAM */
 typedef struct {
     uint32_t magic;
     uint32_t boots, hangs, faults;
-    uint32_t host_to_wifi, wifi_to_host, txdrop, reflected, poolfail;
+    uint32_t host_to_wifi, wifi_to_host, txdrop, reflected, poolfail, rxdrop;
 } crashlog_t;
 static RTC_NOINIT_ATTR crashlog_t s_crashlog;
 static bridge_crash_info_t s_crash; /* boot-time evaluation, served to the console */
@@ -69,6 +73,7 @@ static void snapshot_timer_cb(void *arg)
     s_crashlog.txdrop = s_cnt_txdrop;
     s_crashlog.reflected = s_cnt_reflected;
     s_crashlog.poolfail = s_cnt_poolfail;
+    s_crashlog.rxdrop = s_cnt_rxdrop;
 }
 
 static void crashlog_boot(void)
@@ -84,6 +89,7 @@ static void crashlog_boot(void)
         s_crash.pre.txdrop = s_crashlog.txdrop;
         s_crash.pre.reflected = s_crashlog.reflected;
         s_crash.pre.poolfail = s_crashlog.poolfail;
+        s_crash.pre.rxdrop = s_crashlog.rxdrop;
         if (rr == ESP_RST_PANIC) {
             s_crashlog.faults++;
             s_crash.recovered = "panic";
@@ -173,7 +179,15 @@ static esp_err_t pkt_wifi2usb(void *buffer, uint16_t len, void *eb)
         esp_wifi_internal_free_rx_buffer(eb);
         return ESP_OK;
     }
-    if (tinyusb_net_send_sync(buffer, len, eb, portMAX_DELAY) != ESP_OK) {
+    /* send_sync fails immediately when every NTB is full (USB backpressure);
+     * one brief retry rides out a burst without stalling the Wi-Fi task. */
+    esp_err_t err = tinyusb_net_send_sync(buffer, len, eb, pdMS_TO_TICKS(50));
+    if (err != ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(2));
+        err = tinyusb_net_send_sync(buffer, len, eb, pdMS_TO_TICKS(50));
+    }
+    if (err != ESP_OK) {
+        s_cnt_rxdrop++;
         esp_wifi_internal_free_rx_buffer(eb);
     } else {
         s_cnt_wifi_to_host++;
@@ -233,6 +247,7 @@ void bridge_get_stats(bridge_stats_t *s)
     s->txdrop = s_cnt_txdrop;
     s->reflected = s_cnt_reflected;
     s->poolfail = s_cnt_poolfail;
+    s->rxdrop = s_cnt_rxdrop;
 }
 
 const char *bridge_link_status(void)

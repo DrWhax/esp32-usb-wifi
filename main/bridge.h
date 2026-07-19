@@ -12,6 +12,7 @@ typedef struct {
     uint32_t txdrop;        /* host -> Wi-Fi dropped (not associated) */
     uint32_t reflected;     /* Wi-Fi -> host dropped (host's own frame echoed by the AP) */
     uint32_t poolfail;      /* host -> Wi-Fi dropped (driver out of TX buffers) */
+    uint32_t rxdrop;        /* Wi-Fi -> host dropped (USB NTB backpressure) */
 } bridge_stats_t;
 
 void bridge_get_stats(bridge_stats_t *s);

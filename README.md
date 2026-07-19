@@ -1,12 +1,10 @@
 # esp32-usb-eth
 
-ESP32-S3 port of [pico-usb-wifi](../pico-usb-wifi): a driverless USB Wi-Fi
+ESP32-S3 port of [pico-usb-wifi](https://gitlab.com/baiyibai/pico-usb-wifi): a driverless USB Wi-Fi
 adapter (USB CDC-NCM device bridging to a Wi-Fi station).
 
 Seeded from Espressif's `tusb_ncm` example (ESP-IDF v5.5,
-`examples/peripherals/usb/device/tusb_ncm`, Unlicense/CC0; upstream README
-kept as `README.upstream.md`), extended per the port plan
-(`../pico-usb-wifi/esp32_plan.md`) with:
+`examples/peripherals/usb/device/tusb_ncm`, Unlicense/CC0.
 
 * station MAC adoption + raw L2 forwarding (`esp_wifi_internal_*`, no `esp_netif`)
 * reflection filter (drops the host's own frames echoed back by the AP)
