@@ -25,7 +25,10 @@ import time
 import serial
 
 PROMPT = b"(set|scan|list|use|save) #"
-GLOBS = ("/dev/cu.usbmodem*", "/dev/ttyACM*")
+# Only ports carrying the device's USB serial number ("123456"). The ROM
+# download-mode port has a different name; probing it would collide with an
+# esptool flash in progress ("multiple access on port").
+GLOBS = ("/dev/cu.usbmodem123456*", "/dev/ttyACM*")
 
 
 def candidate_ports(explicit=None):
