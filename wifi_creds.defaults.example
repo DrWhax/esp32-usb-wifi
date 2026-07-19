@@ -1,0 +1,4 @@
+# Copy to wifi_creds.defaults (gitignored) and edit, then build with:
+#   SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;wifi_creds.defaults" idf.py build
+CONFIG_ESP_WIFI_SSID="myssid"
+CONFIG_ESP_WIFI_PASSWORD="mypassword"
