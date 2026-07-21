@@ -5,6 +5,8 @@ adapter (USB CDC-NCM device bridging to a Wi-Fi station).
 
 Speeds are max USB 2.0 full speed. Speedtests show speeds of roughly 5.7Mbps.
 
+![speedtest](images/speedtest.png)
+
 Seeded from Espressif's `tusb_ncm` example (ESP-IDF v5.5,
 `examples/peripherals/usb/device/tusb_ncm`, Unlicense/CC0.
 
